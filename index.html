@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Ant Simulator</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: white; font-family: Arial, sans-serif; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0,0,0,0.5);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            max-width: 250px;
+        }
+        /* Styling for lil-gui */
+         .lil-gui { --background-color: rgba(40,40,40,0.8); --text-color: #eee; --title-background-color: #333; --widget-color: #555; --hover-color: #666; --focus-color: #888; --number-color: #2cc; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <strong>Ant Simulator Controls:</strong><br/>
+        - Mouse Drag: Rotate Camera<br/>
+        - Scroll Wheel: Zoom<br/>
+        - Right-Click Drag: Pan Camera<br/>
+        - Shift + Click Ground: Add Food<br/>
+        <hr>
+        <strong>Stats:</strong><br/>
+        <span id="stats">Initializing...</span>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                 "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import GUI from 'lil-gui';
+
+// --- Simulation Configuration ---
+const CONFIG = {
+            ANT_COUNT: 100,
+            WORLD_SIZE: 100,
+            ANT_SPEED: 0.15,
+            ANT_WIGGLE_SPEED: 0.5, // Animation speed
+            ANT_STEER_FORCE: 0.08, // How strongly ants follow trails / avoid obstacles
+            ANT_WANDER_STRENGTH: 0.01, // Randomness in movement
+            PHEROMONE_DROP_RATE: 5, // Frames between drops
+            PHEROMONE_LIFETIME: 600, // Frames until fade out
+            MAX_PHEROMONES: 3000, // Max pheromones per trail type
+            PHEROMONE_DETECT_RADIUS: 1.5, // How far ants 'smell' pheromones
+            PHEROMONE_FOLLOW_ANGLE: Math.PI / 2.5, // Angle range for sensing pheromones (radians)
+            FOOD_DETECTION_RADIUS: 1.5, // <<<< ****** ADD THIS LINE ****** (adjust value if needed, 1.5 seems reasonable)
+            OBSTACLE_AVOID_DISTANCE: 2.0, // How far ants 'see' obstacles
+            OBSTACLE_AVOID_WEIGHT: 0.15, // How strongly they avoid obstacles
+            NEST_RADIUS: 5,
+            FOOD_AMOUNT: 150, // Initial amount per food pile
+            EXPLORER_RATIO: 0.2, // Percentage of ants that start as explorers
+            ENABLE_BLOOM: true, // Post-processing effect (can impact performance)
+            BLOOM_STRENGTH: 0.4,
+            BLOOM_RADIUS: 0.3,
+            BLOOM_THRESHOLD: 0.75,
+        };
+        // --- Global Variables ---
+        let scene, camera, renderer, controls, composer, bloomPass;
+        let ground, nestMesh;
+        const ants = [];
+        const foodSources = [];
+        const obstacles = [];
+        const clock = new THREE.Clock();
+        let foodPheromoneTrail, homePheromoneTrail;
+        let statsPanel;
+        let foodCollected = 0;
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+
+        // --- Ant Roles & States ---
+        const AntRole = { EXPLORER: 'EXPLORER', WORKER: 'WORKER' };
+        const AntState = {
+            IDLE: 'IDLE', // Should ideally not happen often
+            EXPLORING: 'EXPLORING', // Random search, dropping home trail
+            SEEKING_FOOD: 'SEEKING_FOOD', // Actively looking or following food trail
+            RETURNING_HOME: 'RETURNING_HOME', // Carrying food, dropping food trail, following home trail
+            AVOIDING_OBSTACLE: 'AVOIDING_OBSTACLE' // Temporary state
+        };
+
+        // --- Pheromone Trail Manager (Using THREE.Points) ---
+        class PheromoneTrail {
+            constructor(type, color, maxPoints) {
+                this.type = type;
+                this.maxPoints = maxPoints;
+                this.pointsData = []; // { position: Vector3, life: number, initialLife: number }
+
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+                geometry.setAttribute('color', new THREE.Float32BufferAttribute([], 3));
+                geometry.setAttribute('size', new THREE.Float32BufferAttribute([], 1));
+
+                const material = new THREE.PointsMaterial({
+                    size: 0.3,
+                    vertexColors: true,
+                    transparent: true,
+                    opacity: 0.8,
+                    sizeAttenuation: true,
+                    depthWrite: false, // Prevents particles obscuring each other weirdly
+                    blending: THREE.AdditiveBlending // Brighter where trails overlap
+                });
+
+                this.points = new THREE.Points(geometry, material);
+                scene.add(this.points);
+            }
+
+            addPheromone(position) {
+                if (this.pointsData.length >= this.maxPoints) {
+                    // Remove the oldest point if max capacity reached
+                    this.pointsData.shift();
+                }
+                this.pointsData.push({
+                    position: position.clone(),
+                    life: CONFIG.PHEROMONE_LIFETIME,
+                    initialLife: CONFIG.PHEROMONE_LIFETIME
+                });
+                this.needsUpdate = true; // Flag to rebuild geometry buffers
+            }
+
+            update() {
+                let needsUpdate = this.needsUpdate; // Check if geometry needs full rebuild
+                const positions = [];
+                const colors = [];
+                const sizes = [];
+                const baseColor = (this.type === 'food') ? new THREE.Color(0x00ff00) : new THREE.Color(0x0088ff);
+
+                for (let i = this.pointsData.length - 1; i >= 0; i--) {
+                    const p = this.pointsData[i];
+                    p.life--;
+
+                    if (p.life <= 0) {
+                        this.pointsData.splice(i, 1);
+                        needsUpdate = true; // Need to rebuild buffers after removal
+                    } else {
+                        positions.push(p.position.x, p.position.y, p.position.z);
+
+                        const lifeRatio = p.life / p.initialLife;
+                        const color = baseColor.clone().multiplyScalar(lifeRatio * 0.8 + 0.2); // Fade color intensity
+                        colors.push(color.r, color.g, color.b);
+
+                        const size = this.points.material.size * lifeRatio * lifeRatio; // Fade size (non-linear)
+                        sizes.push(Math.max(0.05, size)); // Ensure minimum size
+                    }
+                }
+
+                 // Update geometry attributes if necessary
+                 if (needsUpdate || this.pointsData.length > 0) { // Only update if there are points or changes
+                    this.points.geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                    this.points.geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+                    this.points.geometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+                    this.points.geometry.attributes.position.needsUpdate = true;
+                    this.points.geometry.attributes.color.needsUpdate = true;
+                    this.points.geometry.attributes.size.needsUpdate = true;
+                    this.points.geometry.computeBoundingSphere(); // Important for visibility checks
+                    this.needsUpdate = false;
+                 }
+            }
+
+            // Method for ants to query nearby pheromones
+             getNearbyPheromones(position, radius) {
+                 const nearby = [];
+                 const radiusSq = radius * radius;
+                 for (const p of this.pointsData) {
+                     if (position.distanceToSquared(p.position) < radiusSq) {
+                         nearby.push(p); // Return the data object { position, life, initialLife }
+                     }
+                 }
+                 return nearby;
+             }
+        }
+
+
+        // --- Ant Class ---
+        class Ant {
+            constructor(role = AntRole.WORKER) {
+                this.role = role;
+                this.state = AntState.EXPLORING;
+                this.hasFood = false;
+                this.targetFood = null;
+                this.pheromoneCooldown = Math.random() * CONFIG.PHEROMONE_DROP_RATE; // Stagger initial drops
+                this.timeSinceStateChange = 0;
+
+                // Visuals - Simple segmented body
+                const bodyMat = new THREE.MeshStandardMaterial({ color: 0x4B3621, roughness: 0.8, metalness: 0.2 });
+                const headGeo = new THREE.SphereGeometry(0.15, 8, 6);
+                const bodyGeo = new THREE.CapsuleGeometry(0.1, 0.2, 4, 8);
+                const abdomenGeo = new THREE.SphereGeometry(0.18, 8, 6);
+
+                this.head = new THREE.Mesh(headGeo, bodyMat);
+                this.body = new THREE.Mesh(bodyGeo, bodyMat);
+                this.abdomen = new THREE.Mesh(abdomenGeo, bodyMat);
+
+                this.head.position.z = 0.2; // Front
+                this.abdomen.position.z = -0.25; // Back
+
+                this.mesh = new THREE.Group();
+                this.mesh.add(this.head);
+                this.mesh.add(this.body);
+                this.mesh.add(this.abdomen);
+
+                this.mesh.position.set(
+                    (Math.random() - 0.5) * CONFIG.NEST_RADIUS * 0.8,
+                    0.18, // Height based on largest segment radius
+                    (Math.random() - 0.5) * CONFIG.NEST_RADIUS * 0.8
+                );
+
+                // Movement
+                this.velocity = new THREE.Vector3(
+                    (Math.random() - 0.5), 0, (Math.random() - 0.5)
+                ).normalize().multiplyScalar(CONFIG.ANT_SPEED);
+                this.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), this.velocity.clone().normalize()); // Initial look direction
+
+                 // Simple animation timing
+                 this.wiggleTime = Math.random() * Math.PI * 2;
+
+                scene.add(this.mesh);
+            }
+
+            setState(newState) {
+                if (this.state !== newState) {
+                    this.state = newState;
+                    this.timeSinceStateChange = 0;
+                    // Visual cue for carrying food
+                    this.abdomen.material.color.set(this.hasFood ? 0x9ACD32 : 0x4B3621); // YellowGreen when carrying
+                }
+            }
+
+            update(deltaTime) {
+                this.timeSinceStateChange += deltaTime;
+                this.pheromoneCooldown = Math.max(0, this.pheromoneCooldown - 1);
+
+                const desiredVelocity = this.calculateBehavior();
+                const steeringForce = desiredVelocity.sub(this.velocity).multiplyScalar(CONFIG.ANT_STEER_FORCE);
+                this.velocity.add(steeringForce).normalize().multiplyScalar(CONFIG.ANT_SPEED);
+
+                // Apply movement
+                this.mesh.position.add(this.velocity.clone().multiplyScalar(deltaTime * 60)); // Scale by deltaTime (assuming 60fps base)
+                this.mesh.position.y = 0.18; // Keep on ground
+
+                 // Update orientation smoothly
+                 if (this.velocity.lengthSq() > 0.001) {
+                    const targetQuaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), this.velocity.clone().normalize());
+                    this.mesh.quaternion.slerp(targetQuaternion, 0.1); // Smooth rotation
+                 }
+
+                 // Simple wiggle animation
+                 this.wiggleTime += CONFIG.ANT_WIGGLE_SPEED * deltaTime * 60;
+                 this.body.rotation.y = Math.sin(this.wiggleTime) * 0.1;
+                 this.abdomen.rotation.y = Math.sin(this.wiggleTime + 0.5) * 0.15;
+
+
+                // World Boundaries (simple wrap around)
+                const halfSize = CONFIG.WORLD_SIZE / 2;
+                 if (Math.abs(this.mesh.position.x) > halfSize) this.mesh.position.x = -Math.sign(this.mesh.position.x) * halfSize;
+                 if (Math.abs(this.mesh.position.z) > halfSize) this.mesh.position.z = -Math.sign(this.mesh.position.z) * halfSize;
+
+
+                // Drop Pheromones
+                this.dropPheromone();
+            }
+
+             calculateBehavior() {
+                 const avoidance = this.calculateAvoidance();
+                 if (avoidance.lengthSq() > 0.01) {
+                     // If strong avoidance needed, prioritize it
+                     return avoidance.normalize().multiplyScalar(CONFIG.ANT_SPEED);
+                 }
+
+                 let behaviorVelocity = new THREE.Vector3();
+
+                 switch (this.state) {
+                    case AntState.EXPLORING:
+                        behaviorVelocity = this.explore();
+                        this.checkForFood();
+                        break;
+                    case AntState.SEEKING_FOOD:
+                        behaviorVelocity = this.seekFood();
+                        this.checkForFood(); // Check if arrived
+                        break;
+                    case AntState.RETURNING_HOME:
+                        behaviorVelocity = this.returnHome();
+                        this.checkIfHome();
+                        break;
+                     default: // IDLE or unexpected state
+                         behaviorVelocity = this.wander();
+                         break;
+                 }
+
+                 // Combine behavior with avoidance (weaker influence if no strong avoidance)
+                 return behaviorVelocity.add(avoidance).normalize().multiplyScalar(CONFIG.ANT_SPEED);
+             }
+
+             calculateAvoidance() {
+                 let avoidanceForce = new THREE.Vector3();
+                 const ahead = this.mesh.position.clone().add(this.velocity.clone().normalize().multiplyScalar(CONFIG.OBSTACLE_AVOID_DISTANCE * 0.5));
+                 const ahead2 = this.mesh.position.clone().add(this.velocity.clone().normalize().multiplyScalar(CONFIG.OBSTACLE_AVOID_DISTANCE)); // Further ahead point
+
+                 // Check obstacles
+                 for (const obstacle of obstacles) {
+                     const distToAhead = ahead.distanceTo(obstacle.position);
+                     const distToAhead2 = ahead2.distanceTo(obstacle.position);
+                     const avoidanceRadius = obstacle.radius + CONFIG.OBSTACLE_AVOID_DISTANCE;
+
+                     if (distToAhead < avoidanceRadius || distToAhead2 < avoidanceRadius) {
+                         // Calculate force away from obstacle center
+                         const awayVector = ahead.clone().sub(obstacle.position).normalize();
+                         // Weight force more strongly the closer the ant is
+                         const strength = (avoidanceRadius - Math.min(distToAhead, distToAhead2)) / avoidanceRadius;
+                         avoidanceForce.add(awayVector.multiplyScalar(strength * CONFIG.OBSTACLE_AVOID_WEIGHT));
+                     }
+                 }
+
+                // TODO: Add ant-to-ant avoidance? (computationally expensive)
+
+                return avoidanceForce;
+            }
+
+
+             wander() {
+                 // Add slight random vector to current velocity
+                 const wanderForce = new THREE.Vector3(
+                     Math.random() - 0.5, 0, Math.random() - 0.5
+                 ).normalize().multiplyScalar(CONFIG.ANT_WANDER_STRENGTH);
+                 return this.velocity.clone().add(wanderForce);
+             }
+
+             explore() {
+                 // Similar to wander, maybe slightly more directed for explorers
+                 let exploreForce = this.wander();
+                 if (this.role === AntRole.EXPLORER && Math.random() < 0.01) {
+                    // Occasionally pick a more distant random target point within world bounds?
+                 }
+                 // Try following home trail back if lost? (Could add complexity)
+                 return exploreForce;
+             }
+
+
+             seekFood() {
+                 // 1. Try to follow food pheromones
+                 const foodTrailForce = this.followTrail(foodPheromoneTrail);
+                 if (foodTrailForce.lengthSq() > 0.01) {
+                     return foodTrailForce;
+                 }
+                 // 2. If no trail found, revert to exploring behavior
+                 //    (Worker ants might be more persistent in searching near last known pheromone)
+                 if(this.role === AntRole.WORKER && Math.random() < 0.8) {
+                     // Workers are less likely to just wander off immediately
+                     // Keep searching in current general direction
+                      return this.velocity.clone().add(this.wander().multiplyScalar(0.1)); // Less wandering
+                 } else {
+                     return this.explore(); // Explorers or workers giving up on trail go back to exploring
+                 }
+             }
+
+            checkForFood() {
+                 if (this.hasFood) return;
+
+                 for (let i = foodSources.length - 1; i >= 0; i--) {
+                     const food = foodSources[i];
+                     if (this.mesh.position.distanceTo(food.mesh.position) < (food.currentRadius + CONFIG.FOOD_DETECTION_RADIUS)) {
+                        if (food.takePiece()) { // Check if food was actually taken
+                            this.hasFood = true;
+                            this.targetFood = food;
+                            this.setState(AntState.RETURNING_HOME);
+                            // Turn around (roughly)
+                            this.velocity.negate();
+                            foodCollected++; // Increment global counter
+                            break;
+                        } else {
+                            // Food source depleted before ant got there
+                            foodSources.splice(i, 1); // Remove from list
+                        }
+                     }
+                 }
+            }
+
+             returnHome() {
+                 // 1. Try to follow home pheromones (if any exist nearby)
+                 const homeTrailForce = this.followTrail(homePheromoneTrail);
+                 if (homeTrailForce.lengthSq() > 0.01) {
+                     // If following home trail, prioritize it
+                     return homeTrailForce;
+                 }
+
+                 // 2. If no home trail, steer directly towards nest center
+                 const directionToHome = new THREE.Vector3(0, 0, 0).sub(this.mesh.position).setY(0).normalize();
+                 // Blend current velocity with home direction (less wandering influence)
+                 const steerTowardsHome = directionToHome.multiplyScalar(CONFIG.ANT_STEER_FORCE * 0.8); // Stronger pull home
+                 return this.velocity.clone().add(steerTowardsHome);
+             }
+
+             checkIfHome() {
+                 if (this.mesh.position.length() < CONFIG.NEST_RADIUS) {
+                     if (this.hasFood) {
+                         this.hasFood = false;
+                         this.targetFood = null;
+                         // Optional: Add food score to nest here
+                         console.log("Ant returned food!");
+                         // Decide next action: Could specifically go back towards last food source
+                         // For now, just start seeking again
+                         this.setState(AntState.SEEKING_FOOD);
+                         // Point roughly away from nest
+                         this.velocity.applyAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI + (Math.random() - 0.5));
+
+                     } else {
+                         // Arrived home without food (e.g., explorer returning)
+                         this.setState(AntState.EXPLORING); // Go back out exploring
+                     }
+                 }
+             }
+
+             // --- Pheromone Handling ---
+             dropPheromone() {
+                 if (this.pheromoneCooldown <= 0) {
+                     const dropPos = this.mesh.position.clone().setY(0.05); // Slightly above ground
+                     if (this.state === AntState.RETURNING_HOME && this.hasFood) {
+                         foodPheromoneTrail.addPheromone(dropPos);
+                     } else if (this.state === AntState.EXPLORING || this.state === AntState.SEEKING_FOOD) {
+                         // Drop home trail when moving away from nest
+                         if (this.mesh.position.length() > CONFIG.NEST_RADIUS * 1.2) { // Don't drop right inside nest
+                            homePheromoneTrail.addPheromone(dropPos);
+                         }
+                     }
+                     this.pheromoneCooldown = CONFIG.PHEROMONE_DROP_RATE;
+                 }
+             }
+
+             followTrail(pheromoneTrail) {
+                 const sensingRadius = CONFIG.PHEROMONE_DETECT_RADIUS;
+                 const sensingAngle = CONFIG.PHEROMONE_FOLLOW_ANGLE;
+                 const sensorCenter = this.mesh.position.clone().add(this.velocity.clone().normalize().multiplyScalar(sensingRadius * 0.6)); // Point slightly ahead
+
+                 const nearbyPheromones = pheromoneTrail.getNearbyPheromones(sensorCenter, sensingRadius * 1.5); // Slightly larger radius query
+
+                 let totalStrength = 0;
+                 const averageDirection = new THREE.Vector3();
+
+                 if (nearbyPheromones.length === 0) {
+                     return averageDirection; // Return zero vector if no pheromones found
+                 }
+
+                 const forwardVector = this.velocity.clone().normalize();
+
+                 for (const p of nearbyPheromones) {
+                     const vectorToPheromone = p.position.clone().sub(this.mesh.position);
+                     const distance = vectorToPheromone.length();
+
+                     if (distance > 0.1 && distance < sensingRadius) { // Check distance
+                         const angle = forwardVector.angleTo(vectorToPheromone);
+
+                         if (angle < sensingAngle / 2) { // Check if within sensing cone
+                             const strength = (p.life / p.initialLife) * (1.0 - distance / sensingRadius); // Weight by age and proximity
+                             averageDirection.add(vectorToPheromone.normalize().multiplyScalar(strength));
+                             totalStrength += strength;
+                         }
+                     }
+                 }
+
+                 if (totalStrength > 0) {
+                    averageDirection.multiplyScalar(1.0 / totalStrength); // Normalize weighted average
+                     // Return the desired direction (caller will handle steering)
+                     return averageDirection.normalize().multiplyScalar(CONFIG.ANT_SPEED);
+                 } else {
+                     return new THREE.Vector3(); // No pheromones in range/angle
+                 }
+             }
+        }
+
+        // --- Food Source Class ---
+        class FoodSource {
+            constructor(position, initialAmount = CONFIG.FOOD_AMOUNT) {
+                this.initialAmount = initialAmount;
+                this.currentAmount = initialAmount;
+                this.baseRadius = 2.0; // Base radius when full
+                this.currentRadius = this.calculateRadius();
+
+                const geometry = new THREE.IcosahedronGeometry(this.baseRadius, 1); // Use Icosahedron for chunkier look
+                const material = new THREE.MeshStandardMaterial({ color: 0x32CD32, roughness: 0.6, flatShading: true }); // LimeGreen, flat shading
+                this.mesh = new THREE.Mesh(geometry, material);
+                this.mesh.position.copy(position).setY(this.currentRadius); // Sit on ground
+                this.mesh.castShadow = true;
+                this.mesh.userData.isFood = true; // For raycasting identification
+                scene.add(this.mesh);
+            }
+
+            calculateRadius() {
+                if (this.currentAmount <= 0) return 0;
+                // Radius proportional to cube root of amount (volume)
+                return Math.cbrt(this.currentAmount / this.initialAmount) * this.baseRadius;
+            }
+
+            updateScale() {
+                 const newRadius = this.calculateRadius();
+                 this.currentRadius = newRadius;
+
+                 if (newRadius > 0.15) { // Prevent tiny scales
+                    const scale = newRadius / this.baseRadius;
+                    this.mesh.scale.setScalar(scale);
+                    this.mesh.position.setY(newRadius); // Keep it on the ground
+                 } else {
+                     this.dispose(); // Remove if depleted
+                     return false; // Indicate removal
+                 }
+                 return true; // Indicate still active
+            }
+
+            takePiece() {
+                if (this.currentAmount > 0) {
+                    this.currentAmount--;
+                    if (!this.updateScale()) { // Update scale and check if it got removed
+                        return false; // Source was depleted by this action
+                    }
+                    return true; // Piece successfully taken
+                }
+                return false; // Already empty
+            }
+
+             dispose() {
+                 if (this.mesh.parent) {
+                    scene.remove(this.mesh);
+                    this.mesh.geometry.dispose();
+                    this.mesh.material.dispose();
+                 }
+                 const index = foodSources.indexOf(this);
+                 if (index > -1) foodSources.splice(index, 1);
+             }
+        }
+
+        // --- Obstacle Class ---
+        class Obstacle {
+             constructor(position, radius, height) {
+                 this.radius = radius;
+                 const geometry = new THREE.CylinderGeometry(radius, radius * 0.8, height, 12); // Tapered cylinder
+                 geometry.computeBoundingSphere(); // Important for distance checks
+                 const material = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.9, map: createRockTexture() }); // Grey stone
+                 this.mesh = new THREE.Mesh(geometry, material);
+                 this.mesh.position.copy(position).setY(height / 2); // Center vertically
+                 this.mesh.castShadow = true;
+                 this.mesh.receiveShadow = true;
+                 this.position = this.mesh.position; // Store position for easier access
+                 scene.add(this.mesh);
+                 obstacles.push(this);
+             }
+        }
+
+        // Helper to create a procedural rock texture
+        function createRockTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128;
+            canvas.height = 128;
+            const context = canvas.getContext('2d');
+            const imageData = context.createImageData(128, 128);
+            const data = imageData.data;
+
+             for (let i = 0; i < data.length; i += 4) {
+                 const noise = Math.random() * 0.4 + 0.6; // Value between 0.6 and 1.0
+                 const color = Math.floor(THREE.MathUtils.lerp(80, 150, noise)); // Grey scale
+                 data[i] = color;     // R
+                 data[i + 1] = color; // G
+                 data[i + 2] = color + Math.floor(Math.random() * 10 - 5); // B slight variation
+                 data[i + 3] = 255;   // A
+             }
+            context.putImageData(imageData, 0, 0);
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.repeat.set(2, 2); // Repeat texture slightly
+            texture.needsUpdate = true;
+            return texture;
+        }
+
+
+        // --- Initialization ---
+        function init() {
+            statsPanel = document.getElementById('stats');
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a2a3a); // Dark bluish background
+            scene.fog = new THREE.Fog(scene.background, CONFIG.WORLD_SIZE * 0.6, CONFIG.WORLD_SIZE * 1.8);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, CONFIG.WORLD_SIZE * 2.5);
+            camera.position.set(0, CONFIG.WORLD_SIZE * 0.6, CONFIG.WORLD_SIZE * 0.6);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap; // Softer shadows
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+             renderer.toneMappingExposure = 1.0;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting
+            const hemiLight = new THREE.HemisphereLight(0xB1E1FF, 0x49515a, 1.2); // Sky, Ground, Intensity
+            scene.add(hemiLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 2.5);
+            dirLight.position.set(25, 50, 30);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 2048; // Higher res shadows
+            dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.camera.near = 1;
+            dirLight.shadow.camera.far = 150;
+            const shadowCamSize = CONFIG.WORLD_SIZE * 0.7;
+            dirLight.shadow.camera.left = -shadowCamSize;
+            dirLight.shadow.camera.right = shadowCamSize;
+            dirLight.shadow.camera.top = shadowCamSize;
+            dirLight.shadow.camera.bottom = -shadowCamSize;
+            dirLight.shadow.bias = -0.001; // Adjust to prevent shadow artifacts
+            scene.add(dirLight);
+            // const dirLightHelper = new THREE.DirectionalLightHelper(dirLight, 5); scene.add(dirLightHelper);
+            // const shadowHelper = new THREE.CameraHelper(dirLight.shadow.camera); scene.add(shadowHelper);
+
+
+            // Ground
+            const groundGeometry = new THREE.PlaneGeometry(CONFIG.WORLD_SIZE, CONFIG.WORLD_SIZE);
+            // Simple procedural ground texture
+            const groundTexture = createGroundTexture();
+             const groundMaterial = new THREE.MeshStandardMaterial({
+                 map: groundTexture,
+                 roughness: 0.9,
+                 metalness: 0.1,
+                 bumpMap: groundTexture, // Use same texture for subtle bump
+                 bumpScale: 0.5
+             });
+            ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            ground.receiveShadow = true;
+            ground.userData.isGround = true; // For raycasting
+            scene.add(ground);
+
+             // Nest (simple darker depression)
+             const nestGeometry = new THREE.CircleGeometry(CONFIG.NEST_RADIUS, 32);
+             const nestMaterial = new THREE.MeshStandardMaterial({ color: 0x3a2d1d, roughness: 0.95 });
+             nestMesh = new THREE.Mesh(nestGeometry, nestMaterial);
+             nestMesh.rotation.x = -Math.PI / 2;
+             nestMesh.position.setY(0.01); // Slightly above ground to avoid z-fighting
+             nestMesh.receiveShadow = true;
+             scene.add(nestMesh);
+
+            // Pheromone Trails
+            foodPheromoneTrail = new PheromoneTrail('food', 0x00ff00, CONFIG.MAX_PHEROMONES);
+            homePheromoneTrail = new PheromoneTrail('home', 0x0088ff, CONFIG.MAX_PHEROMONES);
+
+            // Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.screenSpacePanning = false; // Keep panning relative to ground
+            controls.maxPolarAngle = Math.PI / 2 - 0.05;
+            controls.minDistance = 5;
+            controls.maxDistance = CONFIG.WORLD_SIZE;
+
+            // Post-processing Composer
+             setupPostProcessing();
+
+
+            // Initial Scene Population
+            populateScene();
+
+            // GUI
+            setupGUI();
+
+            // Event Listeners
+            window.addEventListener('resize', onWindowResize, false);
+            window.addEventListener('pointerdown', onPointerDown, false);
+        }
+
+         // Helper for procedural ground texture
+         function createGroundTexture() {
+             const canvas = document.createElement('canvas');
+             canvas.width = 512; canvas.height = 512;
+             const ctx = canvas.getContext('2d');
+             const imgData = ctx.createImageData(512, 512);
+             const data = imgData.data;
+             const noise = new SimplexNoise(); // Use a noise function
+             for (let x = 0; x < 512; x++) {
+                 for (let y = 0; y < 512; y++) {
+                     const i = (x + y * 512) * 4;
+                     const value = (noise.noise2D(x / 50, y / 50) + 1) / 2; // Noise range 0-1
+                     const color = THREE.MathUtils.lerp(80, 140, value); // Brownish tones
+                     data[i] = color + Math.random() * 10; // R
+                     data[i + 1] = color - Math.random() * 10; // G
+                     data[i + 2] = color * 0.7 + Math.random() * 5; // B
+                     data[i + 3] = 255; // A
+                 }
+             }
+             ctx.putImageData(imgData, 0, 0);
+             const texture = new THREE.CanvasTexture(canvas);
+             texture.wrapS = THREE.RepeatWrapping; texture.wrapT = THREE.RepeatWrapping;
+             texture.repeat.set(4, 4);
+             return texture;
+         }
+
+        // Function to clear and repopulate the scene
+        function populateScene() {
+            // Clear existing ants, food, obstacles
+            ants.forEach(ant => scene.remove(ant.mesh));
+            ants.length = 0;
+            foodSources.forEach(food => food.dispose()); // Use dispose method
+            foodSources.length = 0;
+            obstacles.forEach(obstacle => scene.remove(obstacle.mesh));
+            obstacles.length = 0;
+            foodCollected = 0;
+
+             // (Re)create Pheromone Trails - clear old points
+             if (foodPheromoneTrail) { foodPheromoneTrail.pointsData.length = 0; foodPheromoneTrail.needsUpdate = true; }
+             if (homePheromoneTrail) { homePheromoneTrail.pointsData.length = 0; homePheromoneTrail.needsUpdate = true; }
+
+
+            // Create Ants
+            for (let i = 0; i < CONFIG.ANT_COUNT; i++) {
+                const role = (i < CONFIG.ANT_COUNT * CONFIG.EXPLORER_RATIO) ? AntRole.EXPLORER : AntRole.WORKER;
+                ants.push(new Ant(role));
+            }
+
+            // Initial Food Source(s)
+            const numFood = 3 + Math.floor(Math.random() * 3);
+            for (let i = 0; i < numFood; i++) {
+                 const angle = Math.random() * Math.PI * 2;
+                 const dist = CONFIG.NEST_RADIUS * 2 + Math.random() * (CONFIG.WORLD_SIZE * 0.4 - CONFIG.NEST_RADIUS * 2);
+                 const foodPos = new THREE.Vector3(Math.cos(angle) * dist, 0, Math.sin(angle) * dist);
+                 foodSources.push(new FoodSource(foodPos, CONFIG.FOOD_AMOUNT));
+            }
+
+
+            // Simple Obstacles (Rocks)
+            const numObstacles = 10 + Math.floor(Math.random() * 10);
+             for (let i = 0; i < numObstacles; i++) {
+                 const angle = Math.random() * Math.PI * 2;
+                 const dist = CONFIG.NEST_RADIUS * 1.5 + Math.random() * (CONFIG.WORLD_SIZE * 0.45 - CONFIG.NEST_RADIUS * 1.5);
+                 const pos = new THREE.Vector3(Math.cos(angle) * dist, 0, Math.sin(angle) * dist);
+                 // Ensure obstacles don't overlap food/nest too much
+                 let tooClose = pos.length() < CONFIG.NEST_RADIUS + 3; // Check nest
+                 if (!tooClose) {
+                     for(const food of foodSources) {
+                         if (pos.distanceTo(food.mesh.position) < food.baseRadius + 4) {
+                            tooClose = true; break;
+                         }
+                     }
+                 }
+                 if (!tooClose) {
+                    const radius = 1 + Math.random() * 2.5;
+                    const height = radius * (0.8 + Math.random() * 0.8);
+                    new Obstacle(pos, radius, height);
+                 }
+             }
+        }
+
+
+         // --- Post Processing Setup ---
+         function setupPostProcessing() {
+            composer = new EffectComposer(renderer);
+            const renderPass = new RenderPass(scene, camera);
+            composer.addPass(renderPass);
+
+            bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight),
+                CONFIG.BLOOM_STRENGTH, CONFIG.BLOOM_RADIUS, CONFIG.BLOOM_THRESHOLD);
+            composer.addPass(bloomPass);
+            bloomPass.enabled = CONFIG.ENABLE_BLOOM;
+         }
+
+         // --- GUI Setup ---
+         function setupGUI() {
+            const gui = new GUI();
+             gui.title("Simulation Settings");
+
+            gui.add(CONFIG, 'ANT_COUNT', 10, 300, 10).name('Ant Count').onFinishChange(populateScene);
+            gui.add(CONFIG, 'EXPLORER_RATIO', 0, 1, 0.05).name('Explorer Ratio').onFinishChange(populateScene);
+
+            const pheromoneFolder = gui.addFolder('Pheromones');
+             pheromoneFolder.add(CONFIG, 'PHEROMONE_LIFETIME', 100, 2000, 50).name('Lifetime (frames)');
+             pheromoneFolder.add(CONFIG, 'PHEROMONE_DROP_RATE', 1, 20, 1).name('Drop Rate (frames)');
+             pheromoneFolder.add(CONFIG, 'PHEROMONE_DETECT_RADIUS', 0.5, 5, 0.1).name('Detect Radius');
+             pheromoneFolder.add(CONFIG, 'MAX_PHEROMONES', 500, 10000, 100).name('Max Trail Points').onChange(() => {
+                 // Update trail capacity if changed live
+                 foodPheromoneTrail.maxPoints = CONFIG.MAX_PHEROMONES;
+                 homePheromoneTrail.maxPoints = CONFIG.MAX_PHEROMONES;
+             });
+
+
+            const visualFolder = gui.addFolder('Visuals');
+            visualFolder.add(CONFIG, 'ENABLE_BLOOM').name('Enable Bloom').onChange(value => bloomPass.enabled = value);
+            visualFolder.add(CONFIG, 'BLOOM_STRENGTH', 0, 2, 0.05).name('Bloom Strength').onChange(value => bloomPass.strength = value);
+            visualFolder.add(CONFIG, 'BLOOM_RADIUS', 0, 1, 0.05).name('Bloom Radius').onChange(value => bloomPass.radius = value);
+             visualFolder.add(CONFIG, 'BLOOM_THRESHOLD', 0, 1, 0.05).name('Bloom Threshold').onChange(value => bloomPass.threshold = value);
+
+             gui.add({ resetSimulation: populateScene }, 'resetSimulation').name('Reset Simulation');
+         }
+
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const deltaTime = clock.getDelta();
+
+            // Update Ants
+            ants.forEach(ant => ant.update(deltaTime));
+
+            // Update Pheromone Trails
+            foodPheromoneTrail.update();
+            homePheromoneTrail.update();
+
+            // Update Controls
+            controls.update();
+
+             // Update Stats Panel
+             updateStats();
+
+
+            // Render Scene (using composer if bloom enabled, otherwise direct renderer)
+             if (CONFIG.ENABLE_BLOOM && bloomPass.enabled) {
+                 composer.render();
+             } else {
+                 renderer.render(scene, camera);
+             }
+        }
+
+        // --- Update Stats Display ---
+        function updateStats() {
+             const explorerCount = ants.filter(a => a.role === AntRole.EXPLORER).length;
+             const workerCount = ants.length - explorerCount;
+             const carryingCount = ants.filter(a => a.hasFood).length;
+             const foodTrailPoints = foodPheromoneTrail.pointsData.length;
+             const homeTrailPoints = homePheromoneTrail.pointsData.length;
+
+             statsPanel.innerHTML = `
+                Ants: ${ants.length} (E: ${explorerCount}, W: ${workerCount})<br/>
+                Carrying Food: ${carryingCount}<br/>
+                Food Collected: ${foodCollected}<br/>
+                Food Sources: ${foodSources.length}<br/>
+                Food Trail: ${foodTrailPoints}/${CONFIG.MAX_PHEROMONES}<br/>
+                Home Trail: ${homeTrailPoints}/${CONFIG.MAX_PHEROMONES}<br/>
+                FPS: ${Math.round(1/clock.getDelta())}
+             `;
+        }
+
+
+        // --- Event Handlers ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight); // Update composer size too
+        }
+
+         function onPointerDown(event) {
+             // Check for Shift key for adding food
+             if (!event.shiftKey) return;
+
+             mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+             mouse.y = - (event.clientY / window.innerHeight) * 2 + 1;
+
+             raycaster.setFromCamera(mouse, camera);
+             const intersects = raycaster.intersectObject(ground); // Only intersect ground
+
+             if (intersects.length > 0) {
+                 const point = intersects[0].point;
+                 // Check if click is outside the nest area before adding food
+                 if (point.length() > CONFIG.NEST_RADIUS * 1.5) {
+                    foodSources.push(new FoodSource(point.setY(0), CONFIG.FOOD_AMOUNT));
+                    console.log("Added food at:", point.x.toFixed(1), point.z.toFixed(1));
+                 } else {
+                     console.log("Cannot add food inside the nest area.");
+                 }
+             }
+         }
+
+        // --- Simplex Noise (for procedural textures) ---
+        // Basic implementation - for a real project, use a library or more robust version
+        class SimplexNoise {
+            // Placeholder - In a real scenario, you'd paste a Simplex Noise implementation here
+            // For now, just returns basic random values to make the texture code run
+            noise2D(x, y) { return Math.random() * 2 - 1; }
+        }
+
+        // --- Start Simulation ---
+        init();
+        animate();
+
+    </script>
+</body>
+</html>
